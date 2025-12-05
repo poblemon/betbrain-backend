@@ -116,15 +116,15 @@ async def get_standings(league_id: int):
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
-```
+
 
 ### **Archivo 2: `requirements.txt`**
-```
+
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 httpx==0.25.1
-```
+
 
 ### **Archivo 3: `Procfile`** (para Render)
-```
+
 web: uvicorn main:app --host 0.0.0.0 --port $PORT
