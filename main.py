@@ -6,12 +6,10 @@ FastAPI backend para manejar llamadas a Football-Data.org
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
-from typing import Optional
 from datetime import datetime, timedelta
 
 app = FastAPI(title="BetBrain IA API", version="1.0.0")
 
-# CORS - Permitir llamadas desde el frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,11 +18,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configuración
 FOOTBALL_DATA_API = "https://api.football-data.org/v4"
 FOOTBALL_DATA_TOKEN = "c8e58951f8eb4904a5bf090c681d5e62"
 
-# Cache simple
 cache = {}
 CACHE_DURATION = 300
 
@@ -116,15 +112,3 @@ async def get_standings(league_id: int):
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
-
-
-### **Archivo 2: `requirements.txt`**
-
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-httpx==0.25.1
-
-
-### **Archivo 3: `Procfile`** (para Render)
-
-web: uvicorn main:app --host 0.0.0.0 --port $PORT
