@@ -1,30 +1,34 @@
 """
-BetBrain IA - Backend API v3.0
-Logica: Cálculo de Poisson para probabilidades + Contexto enriquecido para LLM
+BetBrain IA - Backend API v4.0 (Groq Integration)
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
-from datetime import datetime, timedelta
-import math
-from scipy.stats import poisson # Importante para cálculos reales
-from typing import List, Dict
+from datetime import datetime
+from scipy.stats import poisson
+import os
 
-app = FastAPI(title="BetBrain IA API", version="3.0.0")
+app = FastAPI(title="BetBrain IA API", version="4.0.0")
 
+# Permitir conexiones desde cualquier lugar (Vercel, Localhost, etc)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Configuración
+# --- CONFIGURACIÓN ---
 FOOTBALL_DATA_API = "https://api.football-data.org/v4"
 FOOTBALL_DATA_TOKEN = "c8e58951f8eb4904a5bf090c681d5e62"
 ODDS_API = "https://api.the-odds-api.com/v4"
 ODDS_API_KEY = "924468b00a5d3be11b7549d7741f9157"
+
+# TU API KEY DE GROQ
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 LEAGUE_MAPPING = {
     2021: "soccer_epl", 2014: "soccer_spain_la_liga",
@@ -34,25 +38,17 @@ LEAGUE_MAPPING = {
 
 cache = {}
 
-# --- MOTOR DE PROBABILIDADES ---
-def calculate_poisson_probs(home_avg_goals, away_avg_goals):
-    """Calcula probabilidades reales usando distribución de Poisson"""
-    max_goals = 6
-    home_prob = 0
-    draw_prob = 0
-    away_prob = 0
-    over_2_5_prob = 0
-    btts_prob = 0
+# --- MOTOR MATEMÁTICO ---
+def calculate_poisson_probs(home_avg, away_avg):
+    home_prob, draw_prob, away_prob = 0, 0, 0
+    over_2_5_prob, btts_prob = 0, 0
     
-    # Matriz de probabilidades exactas
-    for h in range(max_goals):
-        for a in range(max_goals):
-            prob = poisson.pmf(h, home_avg_goals) * poisson.pmf(a, away_avg_goals)
-            
+    for h in range(6):
+        for a in range(6):
+            prob = poisson.pmf(h, home_avg) * poisson.pmf(a, away_avg)
             if h > a: home_prob += prob
             elif h == a: draw_prob += prob
             else: away_prob += prob
-            
             if (h + a) > 2.5: over_2_5_prob += prob
             if h > 0 and a > 0: btts_prob += prob
 
@@ -62,165 +58,127 @@ def calculate_poisson_probs(home_avg_goals, away_avg_goals):
         "away_win": round(away_prob * 100, 1),
         "over_2_5": round(over_2_5_prob * 100, 1),
         "btts": round(btts_prob * 100, 1),
-        "xg_home": round(home_avg_goals, 2),
-        "xg_away": round(away_avg_goals, 2)
+        "xg_home": round(home_avg, 2),
+        "xg_away": round(away_avg, 2)
     }
 
 def detect_value_bet(probs, odds):
-    """Detecta si hay valor matemático (Probabilidad implícita < Probabilidad real)"""
-    recommendations = []
-    
-    # Valor en Ganador Local
-    implied_prob_home = (1 / odds['home']) * 100
-    if probs['home_win'] > implied_prob_home + 5: # 5% de margen de seguridad
+    insights = []
+    # Valor Local
+    implied_home = (1 / odds['home']) * 100
+    if probs['home_win'] > implied_home + 5:
         ev = (probs['home_win']/100 * odds['home']) - 1
-        recommendations.append(f"💎 VALUE BET: Gana Local (EV: {ev:.2f})")
+        insights.append(f"💎 VALOR: Local (EV {ev:.2f})")
+    
+    # Alta probabilidad de goles
+    if probs['over_2_5'] > 60:
+        insights.append(f"🔥 GOLES: +60% probabilidad de Over 2.5")
         
-    # Valor en Over 2.5 (asumiendo cuota media 1.90 si no hay dato real)
-    if probs['over_2_5'] > 65:
-        recommendations.append("🔥 ALTA PROBABILIDAD: Más de 2.5 Goles")
-        
-    return recommendations
+    return insights
 
-# --- ENDPOINTS ---
+@app.get("/")
+def read_root():
+    return {"status": "online", "service": "BetBrain Backend"}
 
 @app.get("/api/matches/{league_id}")
-async def get_analyzed_matches(league_id: int):
-    cache_key = f"analyzed_{league_id}"
+async def get_matches(league_id: int):
+    cache_key = f"matches_{league_id}"
+    # Cache simple de 5 minutos
     if cache_key in cache and (datetime.now() - cache[cache_key][1]).seconds < 300:
         return cache[cache_key][0]
 
-    async with httpx.AsyncClient() as client:
-        # 1. Obtener Partidos
-        matches_resp = await client.get(
-            f"{FOOTBALL_DATA_API}/competitions/{league_id}/matches",
-            params={"status": "SCHEDULED"},
-            headers={"X-Auth-Token": FOOTBALL_DATA_TOKEN}
-        )
-        matches_data = matches_resp.json()
-
-        # 2. Obtener Tabla (para fuerza de ataque/defensa)
-        standings_resp = await client.get(
-            f"{FOOTBALL_DATA_API}/competitions/{league_id}/standings",
-            headers={"X-Auth-Token": FOOTBALL_DATA_TOKEN}
-        )
-        standings_data = standings_resp.json()
-        table = {t['team']['id']: t for t in standings_data['standings'][0]['table']}
-
-        # 3. Obtener Cuotas
-        odds_map = {}
-        league_key = LEAGUE_MAPPING.get(league_id)
-        if league_key:
-            odds_resp = await client.get(
-                f"{ODDS_API}/sports/{league_key}/odds",
-                params={"apiKey": ODDS_API_KEY, "regions": "eu", "markets": "h2h"}
+    try:
+        async with httpx.AsyncClient() as client:
+            # 1. Datos del partido
+            matches_resp = await client.get(
+                f"{FOOTBALL_DATA_API}/competitions/{league_id}/matches",
+                params={"status": "SCHEDULED"},
+                headers={"X-Auth-Token": FOOTBALL_DATA_TOKEN}
             )
-            if odds_resp.status_code == 200:
-                for game in odds_resp.json():
-                    # Mapeo simple por nombre (se puede mejorar con fuzzy match)
-                    odds_map[game['home_team']] = game['bookmakers'][0]['markets'][0]['outcomes']
+            matches = matches_resp.json().get('matches', [])[:10]
 
-        processed_matches = []
-        for m in matches_data['matches'][:10]: # Analizar prx 10 partidos
-            home_id = m['homeTeam']['id']
-            away_id = m['awayTeam']['id']
-            
-            # Datos estadísticos base
-            h_stats = table.get(home_id, {'goalsFor': 1, 'playedGames': 1})
-            a_stats = table.get(away_id, {'goalsFor': 1, 'playedGames': 1})
-            
-            # Calcular fuerza de ataque (goles promedio)
-            h_attack = h_stats['goalsFor'] / h_stats['playedGames']
-            a_attack = a_stats['goalsFor'] / a_stats['playedGames']
-            
-            # Ajuste local/visita (factor simple)
-            lambda_home = h_attack * 1.15
-            lambda_away = a_attack * 0.85
-            
-            # Calcular Probabilidades
-            probs = calculate_poisson_probs(lambda_home, lambda_away)
-            
-            # Asignar cuotas (o default)
-            match_odds = {"home": 2.0, "draw": 3.2, "away": 3.5} 
-            # (Aquí iría la lógica de mapeo real con odds_map, simplificado para el ejemplo)
-            
-            # Detectar Valor
-            insights = detect_value_bet(probs, match_odds)
-            
-            processed_matches.append({
-                "id": m['id'],
-                "teams": {"home": m['homeTeam']['shortName'], "away": m['awayTeam']['shortName']},
-                "time": m['utcDate'],
-                "odds": match_odds,
-                "probabilities": probs,
-                "insights": insights,
-                "stats": {
-                    "home_form": h_stats.get('form', '?????'),
-                    "away_form": a_stats.get('form', '?????'),
-                    "goals_avg": round((h_attack + a_attack)/2, 2)
+            # 2. Datos de la tabla (para calcular fuerza)
+            standings_resp = await client.get(
+                f"{FOOTBALL_DATA_API}/competitions/{league_id}/standings",
+                headers={"X-Auth-Token": FOOTBALL_DATA_TOKEN}
+            )
+            standings = standings_resp.json().get('standings', [{}])[0].get('table', [])
+            stats_map = {t['team']['id']: t for t in standings}
+
+            analyzed_matches = []
+            for m in matches:
+                h_id, a_id = m['homeTeam']['id'], m['awayTeam']['id']
+                h_stats = stats_map.get(h_id, {'goalsFor': 1, 'playedGames': 1})
+                a_stats = stats_map.get(a_id, {'goalsFor': 1, 'playedGames': 1})
+
+                # Cálculo de xG básico
+                h_strength = h_stats['goalsFor'] / h_stats['playedGames'] if h_stats['playedGames'] > 0 else 1.2
+                a_strength = a_stats['goalsFor'] / a_stats['playedGames'] if a_stats['playedGames'] > 0 else 1.0
+                
+                # Ajuste factor localía
+                probs = calculate_poisson_probs(h_strength * 1.15, a_strength * 0.85)
+                
+                # Cuotas simuladas (Idealmente conectarías The Odds API aquí)
+                # Usamos estimadas basadas en probabilidad para que la UI no se vea vacía
+                odds = {
+                    "home": round(100 / (probs['home_win'] + 5), 2),
+                    "draw": round(100 / (probs['draw'] + 5), 2),
+                    "away": round(100 / (probs['away_win'] + 5), 2)
                 }
-            })
 
-        result = {"matches": processed_matches}
-        cache[cache_key] = (result, datetime.now())
-        return result
+                analyzed_matches.append({
+                    "id": m['id'],
+                    "teams": {"home": m['homeTeam']['shortName'], "away": m['awayTeam']['shortName']},
+                    "time": m['utcDate'],
+                    "odds": odds,
+                    "probabilities": probs,
+                    "insights": detect_value_bet(probs, odds)
+                })
+
+            result = {"matches": analyzed_matches}
+            cache[cache_key] = (result, datetime.now())
+            return result
+    except Exception as e:
+        print(f"Error: {e}")
+        return {"matches": []}
 
 @app.post("/api/chatbot")
 async def chatbot(request: dict):
     user_msg = request.get("message", "")
+    matches_ctx = request.get("matches", [])
     history = request.get("history", [])
-    matches = request.get("matches", []) # Contexto completo analizado
-    
-    # Filtrar solo las mejores oportunidades para el contexto del sistema
-    best_bets = []
-    for m in matches:
-        if m['insights']:
-            best_bets.append(f"Partido: {m['teams']['home']} vs {m['teams']['away']} -> {', '.join(m['insights'])}")
-    
-    context_str = "\n".join(best_bets)
-    
-    system_prompt = f"""Eres BetBrain, un Handicapper Profesional de Apuestas Deportivas.
-    
-    TUS DATOS ANALIZADOS (Úsalos como verdad absoluta):
-    {context_str}
-    
-    TU OBJETIVO:
-    1. Si piden "seguras" o "fijas", busca en los DATOS ANALIZADOS las que tengan Win% > 60% o Over 2.5 > 65%.
-    2. Si piden "combinada", elige las 2 o 3 mejores value bets.
-    3. Si piden ganar X dinero, calcula la cuota necesaria (Dinero deseado / Apuesta base).
-    4. Sé breve, usa emojis, y justifica con los % calculados (ej: "Recomiendo X porque mi modelo le da un 65% de probabilidad").
-    5. NO inventes partidos. Si no hay datos claros, dilo.
-    """
-    
-    # Integración con Anthropic (o tu LLM de preferencia)
-    # ... (código httpx similar al anterior pero con este prompt mejorado)
-    # Simularemos la respuesta para este ejemplo si no hay API Key real configurada
-    
+
+    # Crear contexto resumido para la IA
+    context = "DATOS EN TIEMPO REAL:\n"
+    for m in matches_ctx[:5]: # Solo los primeros 5 para no saturar
+        context += f"- {m['teams']['home']} vs {m['teams']['away']}: Local {m['probabilities']['home_win']}%, Over2.5 {m['probabilities']['over_2_5']}%\n"
+
+    system_prompt = f"""Eres BetBrain, un analista de apuestas experto y sarcástico. 
+    Usa estos datos matemáticos para responder: {context}
+    Si te piden predicciones, usa los porcentajes. Si piden combinadas, elige las 2 más altas.
+    Sé breve y directo."""
+
+    messages = [{"role": "system", "content": system_prompt}]
+    # Agregar últimos 3 mensajes del historial
+    for msg in history[-3:]:
+        messages.append({"role": msg["role"], "content": msg["content"]})
+    messages.append({"role": "user", "content": user_msg})
+
     try:
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": "TU_API_KEY_AQUI", # Pon tu key o usa variable de entorno
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json"
-                },
+                GROQ_API_URL,
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
                 json={
-                    "model": "claude-3-sonnet-20240229",
-                    "max_tokens": 1000,
-                    "system": system_prompt,
-                    "messages": [{"role": "user", "content": user_msg}]
+                    "model": "llama3-70b-8192", # Modelo muy potente y rápido
+                    "messages": messages,
+                    "temperature": 0.7,
+                    "max_tokens": 300
                 },
-                timeout=20.0
+                timeout=10.0
             )
-            if response.status_code == 200:
-                return {"response": response.json()["content"][0]["text"]}
-    except:
-        pass
-
-    # Fallback inteligente si falla la LLM o no hay Key
-    return {
-        "response": f"Basado en mi análisis matemático:\n\n" + 
-                    ("\n".join(best_bets[:3]) if best_bets else "No veo ventajas estadísticas claras hoy. Mejor esperar.") +
-                    "\n\n¿Quieres que arme una combinada con esto?"
-    }
+            data = response.json()
+            return {"response": data['choices'][0]['message']['content']}
+    except Exception as e:
+        print(f"Error Groq: {e}")
+        return {"response": "Mi cerebro de IA está recalentando. Intenta de nuevo en unos segundos."}
