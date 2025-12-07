@@ -258,51 +258,103 @@ async def get_bookmakers():
 
 @app.post("/api/chatbot")
 async def chatbot(request: dict):
-    """Chatbot IA para análisis de apuestas"""
+    """Chatbot IA real con Anthropic Claude"""
     user_message = request.get("message", "")
-    context = request.get("context", {})  # Partidos disponibles, etc.
+    conversation_history = request.get("history", [])
+    matches_context = request.get("matches", [])
     
-    # Aquí integrarías Claude API o tu lógica de IA
-    # Por ahora, respuestas basadas en reglas
+    # Preparar contexto con partidos reales
+    matches_text = "\n\n".join([
+        f"**{m.get('home')} vs {m.get('away')}**\n"
+        f"Hora: {m.get('time')}\n"
+        f"Cuotas: Local {m.get('odds', {}).get('home')} | Empate {m.get('odds', {}).get('draw')} | Visita {m.get('odds', {}).get('away')}\n"
+        f"xG estimado: {m.get('xGHome', 'N/A')} - {m.get('xGAway', 'N/A')}\n"
+        f"Over 2.5: {m.get('over25', 'N/A')}% | BTTS: {m.get('btts', 'N/A')}%"
+        for m in matches_context[:10]
+    ]) if matches_context else "No hay partidos disponibles actualmente."
     
-    message_lower = user_message.lower()
+    # System prompt para el chatbot
+    system_prompt = f"""Eres BetBrain IA, un asistente experto en análisis de apuestas deportivas.
+
+DATOS ACTUALES DE PARTIDOS:
+{matches_text}
+
+TU MISIÓN:
+1. Analizar los partidos disponibles arriba con datos REALES
+2. Calcular probabilidades basándote en las estadísticas mostradas
+3. Recomendar apuestas con valor real
+4. Ser CONCISO y PRECISO en tus respuestas
+5. Si el usuario pregunta por un equipo específico, SOLO habla de ESE equipo
+6. Siempre usa los datos actuales, no inventes partidos
+
+REGLAS:
+- Si no hay datos de un partido, dilo claramente
+- Explica tus recomendaciones con estadísticas reales
+- Calcula retornos cuando el usuario diga cuánto quiere apostar
+- Si preguntan por "el mejor pick", analiza TODOS los partidos y elige el mejor
+- Sé conversacional pero profesional
+
+FORMATO DE RESPUESTA:
+- Usa emojis para claridad: 📊 ⚽ 💰 ✅ ❌
+- Sé directo y conciso
+- Muestra cálculos cuando sea relevante"""
+
+    # Construir mensajes para Claude
+    messages = []
     
-    # Detectar intención
-    if "cuánto" in message_lower and "ganar" in message_lower:
+    # Agregar historial previo
+    for msg in conversation_history[-5:]:  # Últimos 5 mensajes
+        messages.append({
+            "role": msg["role"],
+            "content": msg["content"]
+        })
+    
+    # Agregar mensaje actual
+    messages.append({
+        "role": "user",
+        "content": user_message
+    })
+    
+    try:
+        # Llamar a Claude API (integrada en Anthropic)
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "Content-Type": "application/json",
+                    "anthropic-version": "2023-06-01"
+                },
+                json={
+                    "model": "claude-sonnet-4-20250514",
+                    "max_tokens": 1000,
+                    "system": system_prompt,
+                    "messages": messages
+                },
+                timeout=30.0
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                assistant_message = data["content"][0]["text"]
+                
+                return {
+                    "response": assistant_message,
+                    "type": "ai_response",
+                    "model": "claude-sonnet-4"
+                }
+            else:
+                # Fallback a respuesta básica si Claude falla
+                return {
+                    "response": f"Entiendo tu pregunta sobre: {user_message}\n\nActualmente tengo {len(matches_context)} partidos disponibles para analizar. ¿Podrías ser más específico sobre qué partido o tipo de apuesta te interesa?",
+                    "type": "fallback"
+                }
+                
+    except Exception as e:
+        print(f"Error en chatbot: {e}")
+        # Respuesta de emergencia
         return {
-            "response": "Entiendo que quieres saber cuánto puedes ganar. ¿Podrías decirme cuánto dinero tienes disponible para apostar? Por ejemplo: 'Tengo 50 soles' o 'Quiero apostar 100 dólares'",
-            "type": "question",
-            "next_step": "ask_amount"
-        }
-    
-    elif "mejor" in message_lower or "recomienda" in message_lower or "picks" in message_lower:
-        # Obtener mejores value bets del contexto
-        return {
-            "response": "Basándome en el análisis actual, estas son mis recomendaciones:\n\n📊 PICKS DE HOY:\n\n1. **Premier League - Aston Villa vs Arsenal**\n   - Recomendación: Over 2.5 goles\n   - Cuota: 1.75\n   - Probabilidad: 68%\n   - Razón: Ambos equipos promedian 2.3 goles por partido, xG combinado de 3.1\n\n2. **LaLiga - Real Madrid vs Girona**\n   - Recomendación: Victoria Real Madrid\n   - Cuota: 1.35\n   - Probabilidad: 78%\n   - Razón: Local invicto, forma excelente (5 victorias consecutivas)\n\n¿Te gustaría que arme una combinada con estos picks?",
-            "type": "recommendation",
-            "picks": [
-                {"match": "Aston Villa vs Arsenal", "pick": "Over 2.5", "odds": 1.75, "prob": 68},
-                {"match": "Real Madrid vs Girona", "pick": "Victoria RM", "odds": 1.35, "prob": 78}
-            ]
-        }
-    
-    elif any(word in message_lower for word in ["hola", "buenos", "qué tal"]):
-        return {
-            "response": "¡Hola! 👋 Soy BetBrain IA, tu asistente experto en análisis de apuestas deportivas.\n\n¿En qué puedo ayudarte hoy?\n\n• 📊 Analizar partidos específicos\n• 💎 Mostrarte las mejores value bets\n• 🎯 Crear combinadas personalizadas\n• 💰 Calcular ganancias potenciales\n\n¿Qué te gustaría hacer?",
-            "type": "greeting"
-        }
-    
-    elif "combinada" in message_lower:
-        return {
-            "response": "¡Perfecto! Voy a crear una combinada para ti.\n\nPrimero, dime: ¿Qué nivel de riesgo prefieres?\n\n1. 🟢 **Segura** (cuotas bajas, alta probabilidad)\n2. 🟡 **Moderada** (equilibrio riesgo-recompensa)\n3. 🔴 **Arriesgada** (cuotas altas, baja probabilidad)",
-            "type": "question",
-            "next_step": "risk_level"
-        }
-    
-    else:
-        return {
-            "response": "Entiendo que quieres información sobre apuestas. Puedo ayudarte con:\n\n• Análisis de partidos específicos\n• Recomendaciones de picks\n• Crear combinadas personalizadas\n• Calcular ganancias\n\n¿Qué te gustaría hacer?",
-            "type": "help"
+            "response": "Disculpa, estoy procesando muchas solicitudes. ¿Puedes reformular tu pregunta?",
+            "type": "error"
         }
 
 @app.get("/health")
