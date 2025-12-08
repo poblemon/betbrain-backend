@@ -1,17 +1,16 @@
 """
-BetBrain IA - Backend Avanzado
-Estadísticas completas: corners, tarjetas, disparos, jugadores, etc.
+BetBrain IA - Backend UNIFICADO (Lista + Detalles + Chat)
 """
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 from datetime import datetime, timedelta
-from typing import Optional, Dict, List
+from typing import List, Dict
 import asyncio
-import json
+from scipy.stats import poisson # Asegúrate de que requirements.txt tenga scipy y numpy
 
-app = FastAPI(title="BetBrain IA Advanced", version="3.0.0")
+app = FastAPI(title="BetBrain IA Master", version="4.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,461 +20,214 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# APIs
+# --- CONFIGURACIÓN ---
+FOOTBALL_DATA_API = "https://api.football-data.org/v4"
 FOOTBALL_DATA_TOKEN = "c8e58951f8eb4904a5bf090c681d5e62"
-ODDS_API_KEY = "924468b00a5d3be11b7549d7741f9157"
-OPENROUTER_API_KEY = "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"
+OPENROUTER_API_KEY = "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"
+
+LEAGUE_MAPPING = {
+    2021: "Premier League", 2014: "La Liga",
+    2019: "Serie A", 2002: "Bundesliga",
+    2015: "Ligue 1"
+}
 
 cache = {}
-CACHE_DURATION = 300
 
-def get_cache(key: str):
-    if key in cache:
-        data, timestamp = cache[key]
-        if datetime.now() - timestamp < timedelta(seconds=CACHE_DURATION):
-            return data
-    return None
-
-def set_cache(key: str, data):
-    cache[key] = (data, datetime.now())
-
-@app.get("/")
-async def root():
+# --- HELPER: Probabilidades Poisson (Para la Lista Principal) ---
+def calculate_poisson_probs(home_avg, away_avg):
+    home_prob, draw_prob, away_prob = 0, 0, 0
+    for h in range(6):
+        for a in range(6):
+            prob = poisson.pmf(h, home_avg) * poisson.pmf(a, away_avg)
+            if h > a: home_prob += prob
+            elif h == a: draw_prob += prob
+            else: away_prob += prob
     return {
-        "name": "BetBrain IA Advanced API",
-        "version": "3.0.0",
-        "features": [
-            "Match Statistics",
-            "Player Stats",
-            "Corners & Cards",
-            "xG & xA",
-            "Team Form",
-            "AI Predictions"
-        ]
+        "home_win": round(home_prob * 100, 1),
+        "draw": round(draw_prob * 100, 1),
+        "away_win": round(away_prob * 100, 1)
     }
 
-@app.get("/api/match/{match_id}/detailed")
-async def get_match_detailed(match_id: int):
-    """
-    Obtiene análisis COMPLETO de un partido:
-    - Estadísticas H2H
-    - Corners promedio
-    - Tarjetas promedio
-    - Disparos
-    - xG histórico
-    - Alineaciones probables
-    - Lesiones
-    - Forma reciente
-    - Estadísticas de jugadores clave
-    """
-    cache_key = f"match_detailed_{match_id}"
-    cached = get_cache(cache_key)
-    if cached:
-        return cached
-    
-    try:
-        async with httpx.AsyncClient() as client:
-            # 1. Info básica del partido
-            match_response = await client.get(
-                f"https://api.football-data.org/v4/matches/{match_id}",
-                headers={"X-Auth-Token": FOOTBALL_DATA_TOKEN},
-                timeout=10.0
-            )
-            match_data = match_response.json()
-            
-            home_team_id = match_data["homeTeam"]["id"]
-            away_team_id = match_data["awayTeam"]["id"]
-            
-            # 2. Estadísticas de equipos (últimos partidos)
-            home_matches = await client.get(
-                f"https://api.football-data.org/v4/teams/{home_team_id}/matches",
-                headers={"X-Auth-Token": FOOTBALL_DATA_TOKEN},
-                params={"limit": 10}
-            )
-            away_matches = await client.get(
-                f"https://api.football-data.org/v4/teams/{away_team_id}/matches",
-                headers={"X-Auth-Token": FOOTBALL_DATA_TOKEN},
-                params={"limit": 10}
-            )
-            
-            home_history = home_matches.json()["matches"]
-            away_history = away_matches.json()["matches"]
-            
-            # Calcular estadísticas avanzadas
-            home_stats = calculate_team_stats(home_history, home_team_id)
-            away_stats = calculate_team_stats(away_history, away_team_id)
-            
-            # 3. Head to Head
-            h2h_response = await client.get(
-                f"https://api.football-data.org/v4/matches/{match_id}/head2head",
-                headers={"X-Auth-Token": FOOTBALL_DATA_TOKEN}
-            )
-            h2h_data = h2h_response.json()
-            
-            # 4. Construir respuesta completa
-            detailed_analysis = {
-                "match": {
-                    "id": match_id,
-                    "home": match_data["homeTeam"]["name"],
-                    "away": match_data["awayTeam"]["name"],
-                    "date": match_data["utcDate"],
-                    "venue": match_data.get("venue", "Unknown"),
-                    "referee": match_data.get("referees", [{}])[0].get("name", "TBD") if match_data.get("referees") else "TBD",
-                    "competition": match_data["competition"]["name"]
-                },
-                "statistics": {
-                    "home": home_stats,
-                    "away": away_stats
-                },
-                "head_to_head": {
-                    "total_matches": len(h2h_data.get("matches", [])),
-                    "home_wins": sum(1 for m in h2h_data.get("matches", []) if m["score"]["winner"] == "HOME_TEAM"),
-                    "away_wins": sum(1 for m in h2h_data.get("matches", []) if m["score"]["winner"] == "AWAY_TEAM"),
-                    "draws": sum(1 for m in h2h_data.get("matches", []) if m["score"]["winner"] == "DRAW"),
-                    "last_matches": h2h_data.get("matches", [])[:5]
-                },
-                "predictions": generate_predictions(home_stats, away_stats, h2h_data),
-                "betting_markets": generate_betting_markets(home_stats, away_stats)
-            }
-            
-            set_cache(cache_key, detailed_analysis)
-            return detailed_analysis
-            
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
-
-def calculate_team_stats(matches: List[Dict], team_id: int) -> Dict:
-    """Calcula estadísticas detalladas de un equipo"""
-    
+# --- HELPER: Stats Detalladas (Para la Vista Individual) ---
+def calculate_detailed_stats(matches: List[Dict], team_id: int):
     stats = {
-        "goals_scored": 0,
-        "goals_conceded": 0,
-        "corners": [],
-        "yellow_cards": 0,
-        "red_cards": 0,
-        "shots": [],
-        "shots_on_target": [],
-        "form": [],
-        "home_form": [],
-        "away_form": [],
-        "xg": 0,
-        "xga": 0,
-        "clean_sheets": 0,
-        "btts_count": 0,
-        "over_25": 0,
-        "over_35": 0,
-        "win_rate": 0,
-        "avg_goals_scored": 0,
-        "avg_goals_conceded": 0
+        "goals_scored": 0, "goals_conceded": 0, "corners": [], 
+        "yellow_cards": 0, "form": [], "over_25": 0, "btts": 0
     }
-    
-    matches_played = 0
-    home_matches = 0
-    away_matches = 0
-    
-    for match in matches:
-        if match["status"] != "FINISHED":
-            continue
-            
-        matches_played += 1
-        is_home = match["homeTeam"]["id"] == team_id
+    played = 0
+    for m in matches:
+        if m["status"] != "FINISHED": continue
+        played += 1
+        is_home = m["homeTeam"]["id"] == team_id
+        gs = m["score"]["fullTime"]["home"] if is_home else m["score"]["fullTime"]["away"]
+        gc = m["score"]["fullTime"]["away"] if is_home else m["score"]["fullTime"]["home"]
         
-        if is_home:
-            home_matches += 1
-            goals_scored = match["score"]["fullTime"]["home"]
-            goals_conceded = match["score"]["fullTime"]["away"]
-        else:
-            away_matches += 1
-            goals_scored = match["score"]["fullTime"]["away"]
-            goals_conceded = match["score"]["fullTime"]["home"]
+        stats["goals_scored"] += gs
+        stats["goals_conceded"] += gc
+        stats["form"].append("W" if gs > gc else "L" if gs < gc else "D")
         
-        stats["goals_scored"] += goals_scored
-        stats["goals_conceded"] += goals_conceded
+        if gs > 0 and gc > 0: stats["btts"] += 1
+        if (gs + gc) > 2.5: stats["over_25"] += 1
         
-        # Forma
-        if goals_scored > goals_conceded:
-            result = "W"
-        elif goals_scored < goals_conceded:
-            result = "L"
-        else:
-            result = "D"
+        # Estimación simple de corners y tarjetas si no hay datos
+        total_goals = gs + gc
+        stats["corners"].append(int(8 + total_goals)) 
+        stats["yellow_cards"] += 2
         
-        stats["form"].append(result)
-        if is_home:
-            stats["home_form"].append(result)
-        else:
-            stats["away_form"].append(result)
-        
-        # Clean sheets
-        if goals_conceded == 0:
-            stats["clean_sheets"] += 1
-        
-        # BTTS
-        if goals_scored > 0 and goals_conceded > 0:
-            stats["btts_count"] += 1
-        
-        # Over/Under
-        total_goals = goals_scored + goals_conceded
-        if total_goals > 2.5:
-            stats["over_25"] += 1
-        if total_goals > 3.5:
-            stats["over_35"] += 1
-        
-        # Estimación de corners (basado en goles - promedio real)
-        estimated_corners = int(9 + (total_goals * 1.5))
-        stats["corners"].append(estimated_corners)
-        
-        # Tarjetas (estimación basada en competitividad)
-        stats["yellow_cards"] += int(2 + abs(goals_scored - goals_conceded) * 0.5)
-        if abs(goals_scored - goals_conceded) > 2:
-            stats["red_cards"] += 1 if matches_played % 10 == 0 else 0
-    
-    # Calcular promedios
-    if matches_played > 0:
-        stats["avg_goals_scored"] = round(stats["goals_scored"] / matches_played, 2)
-        stats["avg_goals_conceded"] = round(stats["goals_conceded"] / matches_played, 2)
+    if played > 0:
+        stats["avg_goals"] = round(stats["goals_scored"] / played, 2)
+        stats["avg_conceded"] = round(stats["goals_conceded"] / played, 2)
         stats["avg_corners"] = round(sum(stats["corners"]) / len(stats["corners"]), 1) if stats["corners"] else 0
-        stats["avg_yellow_cards"] = round(stats["yellow_cards"] / matches_played, 1)
-        stats["btts_percentage"] = round((stats["btts_count"] / matches_played) * 100, 1)
-        stats["over_25_percentage"] = round((stats["over_25"] / matches_played) * 100, 1)
-        stats["over_35_percentage"] = round((stats["over_35"] / matches_played) * 100, 1)
-        stats["win_rate"] = round((stats["form"].count("W") / matches_played) * 100, 1)
-        stats["clean_sheet_rate"] = round((stats["clean_sheets"] / matches_played) * 100, 1)
+        stats["avg_cards"] = round(stats["yellow_cards"] / played, 1)
+        stats["xg"] = round(stats["avg_goals"] * 1.1, 2) # Simulado basado en goles reales
+    else:
+        stats.update({"avg_goals": 0, "avg_conceded": 0, "avg_corners": 0, "avg_cards": 0, "xg": 0})
         
-        # xG estimado (basado en goles reales)
-        stats["xg"] = round(stats["avg_goals_scored"] * 1.05, 2)
-        stats["xga"] = round(stats["avg_goals_conceded"] * 1.05, 2)
-    
-    stats["matches_played"] = matches_played
-    stats["form"] = stats["form"][:5]  # Últimos 5
-    
+    stats["form"] = stats["form"][:5]
     return stats
 
-def generate_predictions(home_stats: Dict, away_stats: Dict, h2h: Dict) -> Dict:
-    """Genera predicciones basadas en estadísticas"""
-    
-    # Probabilidad 1X2
-    home_strength = (home_stats["win_rate"] + home_stats["avg_goals_scored"] * 10) / 2
-    away_strength = (away_stats["win_rate"] + away_stats["avg_goals_scored"] * 10) / 2
-    
-    total_strength = home_strength + away_strength
-    home_prob = (home_strength / total_strength * 100) if total_strength > 0 else 50
-    away_prob = (away_strength / total_strength * 100) if total_strength > 0 else 50
-    draw_prob = 100 - home_prob - away_prob + 15  # Ajuste para empate
-    
-    # Normalizar
-    total = home_prob + draw_prob + away_prob
-    home_prob = (home_prob / total) * 100
-    draw_prob = (draw_prob / total) * 100
-    away_prob = (away_prob / total) * 100
-    
-    # Goles esperados
-    expected_home_goals = (home_stats["avg_goals_scored"] + away_stats["avg_goals_conceded"]) / 2
-    expected_away_goals = (away_stats["avg_goals_scored"] + home_stats["avg_goals_conceded"]) / 2
-    total_expected_goals = expected_home_goals + expected_away_goals
-    
-    # Corners
-    expected_corners = (home_stats["avg_corners"] + away_stats["avg_corners"]) / 2
-    
-    return {
-        "result_1x2": {
-            "home_win": round(home_prob, 1),
-            "draw": round(draw_prob, 1),
-            "away_win": round(away_prob, 1)
-        },
-        "goals": {
-            "expected_home": round(expected_home_goals, 2),
-            "expected_away": round(expected_away_goals, 2),
-            "total_expected": round(total_expected_goals, 2),
-            "over_15": 85 if total_expected_goals > 2 else 70,
-            "over_25": round((home_stats["over_25_percentage"] + away_stats["over_25_percentage"]) / 2, 1),
-            "over_35": round((home_stats["over_35_percentage"] + away_stats["over_35_percentage"]) / 2, 1),
-            "btts": round((home_stats["btts_percentage"] + away_stats["btts_percentage"]) / 2, 1)
-        },
-        "corners": {
-            "expected_total": round(expected_corners, 1),
-            "over_85": 75 if expected_corners > 9 else 55,
-            "over_95": 65 if expected_corners > 10 else 45,
-            "over_105": 50 if expected_corners > 11 else 35
-        },
-        "cards": {
-            "expected_yellow": round((home_stats["avg_yellow_cards"] + away_stats["avg_yellow_cards"]), 1),
-            "over_35_cards": 70,
-            "over_45_cards": 55
-        }
-    }
-
-def generate_betting_markets(home_stats: Dict, away_stats: Dict) -> List[Dict]:
-    """Genera mercados de apuestas con probabilidades"""
-    
-    markets = []
-    
-    # Victoria Local
-    if home_stats["win_rate"] > 60:
-        markets.append({
-            "market": "Victoria Local",
-            "probability": home_stats["win_rate"],
-            "risk": "Bajo" if home_stats["win_rate"] > 70 else "Medio",
-            "recommendation": "✅ Recomendado"
-        })
-    
-    # Over 2.5
-    over_25_avg = (home_stats["over_25_percentage"] + away_stats["over_25_percentage"]) / 2
-    if over_25_avg > 65:
-        markets.append({
-            "market": "Over 2.5 goles",
-            "probability": over_25_avg,
-            "risk": "Bajo",
-            "recommendation": "✅ Recomendado"
-        })
-    
-    # BTTS
-    btts_avg = (home_stats["btts_percentage"] + away_stats["btts_percentage"]) / 2
-    if btts_avg > 60:
-        markets.append({
-            "market": "Ambos anotan",
-            "probability": btts_avg,
-            "risk": "Medio",
-            "recommendation": "⚠️ Considerar"
-        })
-    
-    # Corners Over 9.5
-    avg_corners = (home_stats["avg_corners"] + away_stats["avg_corners"]) / 2
-    if avg_corners > 10:
-        markets.append({
-            "market": "Over 9.5 corners",
-            "probability": 70,
-            "risk": "Medio",
-            "recommendation": "✅ Value bet"
-        })
-    
-    return markets
-
-@app.post("/api/chatbot")
-async def chatbot_ai(request: dict):
-    """
-    Chatbot IA ULTRA INTELIGENTE con OpenRouter
-    Usa Claude Sonnet 3.5 para análisis profesional
-    """
-    user_message = request.get("message", "")
-    conversation_history = request.get("history", [])
-    matches_context = request.get("matches", [])
-    match_details = request.get("match_details", None)
-    
-    # Construir contexto detallado
-    if match_details:
-        context = f"""ANÁLISIS DEL PARTIDO:
-{match_details['match']['home']} vs {match_details['match']['away']}
-
-ESTADÍSTICAS COMPLETAS:
-Local: {match_details['statistics']['home']['avg_goals_scored']} goles/partido | Corners: {match_details['statistics']['home']['avg_corners']} | Tarjetas: {match_details['statistics']['home']['avg_yellow_cards']}
-Visita: {match_details['statistics']['away']['avg_goals_scored']} goles/partido | Corners: {match_details['statistics']['away']['avg_corners']} | Tarjetas: {match_details['statistics']['away']['avg_yellow_cards']}
-
-PREDICCIONES IA:
-- Victoria Local: {match_details['predictions']['result_1x2']['home_win']}%
-- Empate: {match_details['predictions']['result_1x2']['draw']}%
-- Victoria Visita: {match_details['predictions']['result_1x2']['away_win']}%
-- Over 2.5: {match_details['predictions']['goals']['over_25']}%
-- BTTS: {match_details['predictions']['goals']['btts']}%
-- Corners totales: {match_details['predictions']['corners']['expected_total']}
-"""
-    elif matches_context:
-        context = "PARTIDOS DISPONIBLES:\n" + "\n".join([
-            f"{m['home']} vs {m['away']} | Cuotas: {m['odds']['home']}-{m['odds']['draw']}-{m['odds']['away']} | xG: {m.get('xGHome', 'N/A')}-{m.get('xGAway', 'N/A')}"
-            for m in matches_context[:10]
-        ])
-    else:
-        context = "No hay datos de partidos cargados."
-    
-    system_prompt = f"""Eres BetBrain IA, el asistente más avanzado en análisis de apuestas deportivas.
-
-DATOS ACTUALES:
-{context}
-
-TU EXPERTISE:
-- Análisis estadístico profesional
-- Detección de value bets
-- Cálculo de probabilidades precisas
-- Recomendaciones basadas en datos REALES
-- Combinadas optimizadas
-
-REGLAS ESTRICTAS:
-1. SOLO usa datos proporcionados arriba
-2. Si preguntan por un equipo específico, analiza SOLO ese equipo
-3. Sé CONCISO (máximo 4-5 líneas)
-4. Usa emojis: ⚽💰📊✅❌🎯
-5. Si piden combinadas, selecciona las 2-3 mejores opciones
-6. NUNCA inventes datos
-7. Calcula retornos exactos cuando te den una cantidad
-
-FORMATO:
-- Directo al grano
-- Datos numéricos precisos
-- Recomendaciones claras"""
-
-    # Construir mensajes
-    messages = [{"role": "system", "content": system_prompt}]
-    
-    # Historial (últimos 6 mensajes)
-    for msg in conversation_history[-6:]:
-        messages.append({
-            "role": msg["role"],
-            "content": msg["content"]
-        })
-    
-    messages.append({
-        "role": "user",
-        "content": user_message
-    })
-    
+# --- ENDPOINT 1: LISTA DE PARTIDOS (Arregla el 404 de la Home) ---
+@app.get("/api/matches/{league_id}")
+async def get_matches(league_id: int):
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": "https://betbrain-frontend.vercel.app",
-                    "X-Title": "BetBrain IA"
-                },
-                json={
-                    "model": "anthropic/claude-3.5-sonnet",  # Mejor modelo disponible
-                    "messages": messages,
-                    "temperature": 0.7,
-                    "max_tokens": 800
-                },
-                timeout=30.0
+            # 1. Obtener partidos
+            matches_resp = await client.get(
+                f"{FOOTBALL_DATA_API}/competitions/{league_id}/matches",
+                params={"status": "SCHEDULED"},
+                headers={"X-Auth-Token": FOOTBALL_DATA_TOKEN}
             )
-            
-            if response.status_code == 200:
-                data = response.json()
-                assistant_message = data["choices"][0]["message"]["content"]
-                
-                return {
-                    "response": assistant_message,
-                    "type": "ai_response",
-                    "model": "claude-3.5-sonnet",
-                    "provider": "openrouter"
-                }
-            else:
-                error_text = response.text
-                print(f"OpenRouter error: {response.status_code} - {error_text}")
-                return {
-                    "response": f"Analizo tu pregunta sobre: {user_message}\n\n📊 Tengo {len(matches_context)} partidos disponibles.\n¿Podrías ser más específico?",
-                    "type": "fallback"
-                }
-                
-    except Exception as e:
-        print(f"Chatbot error: {e}")
-        return {
-            "response": "🤖 Procesando tu consulta... ¿Puedes reformularla?",
-            "type": "error"
-        }
+            matches = matches_resp.json().get('matches', [])[:12]
 
-@app.get("/health")
-async def health():
-    return {
-        "status": "healthy",
-        "version": "3.0.0",
-        "timestamp": datetime.now().isoformat()
-    }
+            # 2. Obtener tabla para fuerza relativa
+            standings_resp = await client.get(
+                f"{FOOTBALL_DATA_API}/competitions/{league_id}/standings",
+                headers={"X-Auth-Token": FOOTBALL_DATA_TOKEN}
+            )
+            standings = standings_resp.json().get('standings', [{}])[0].get('table', [])
+            stats_map = {t['team']['id']: t for t in standings}
+
+            results = []
+            for m in matches:
+                h_id, a_id = m['homeTeam']['id'], m['awayTeam']['id']
+                
+                # Datos básicos para la lista
+                h_stats = stats_map.get(h_id, {'goalsFor': 1, 'playedGames': 1})
+                a_stats = stats_map.get(a_id, {'goalsFor': 1, 'playedGames': 1})
+                
+                h_strength = h_stats['goalsFor'] / h_stats['playedGames'] if h_stats['playedGames'] > 0 else 1
+                a_strength = a_stats['goalsFor'] / a_stats['playedGames'] if a_stats['playedGames'] > 0 else 1
+                
+                probs = calculate_poisson_probs(h_strength * 1.2, a_strength * 0.9)
+                
+                # Cuotas simuladas basadas en probabilidad
+                odds = {
+                    "home": round(100/(probs['home_win']+1), 2),
+                    "draw": round(100/(probs['draw']+1), 2),
+                    "away": round(100/(probs['away_win']+1), 2)
+                }
+
+                results.append({
+                    "id": m['id'],
+                    "time": m['utcDate'],
+                    "teams": {"home": m['homeTeam']['shortName'], "away": m['awayTeam']['shortName']},
+                    "odds": odds,
+                    "insights": ["Value Bet"] if probs['home_win'] > 60 and odds['home'] > 1.8 else []
+                })
+            
+            return {"matches": results}
+    except Exception as e:
+        print(f"Error list: {e}")
+        return {"matches": []}
+
+# --- ENDPOINT 2: DETALLES DEL PARTIDO (Para la vista al hacer click) ---
+@app.get("/api/match/{match_id}/detailed")
+async def get_match_detailed(match_id: int):
+    try:
+        async with httpx.AsyncClient() as client:
+            # Info básica
+            match_base = await client.get(
+                f"{FOOTBALL_DATA_API}/matches/{match_id}",
+                headers={"X-Auth-Token": FOOTBALL_DATA_TOKEN}
+            )
+            m_data = match_base.json()
+            h_id, a_id = m_data["homeTeam"]["id"], m_data["awayTeam"]["id"]
+
+            # Historial reciente
+            h_hist = await client.get(f"{FOOTBALL_DATA_API}/teams/{h_id}/matches?limit=10", headers={"X-Auth-Token": FOOTBALL_DATA_TOKEN})
+            a_hist = await client.get(f"{FOOTBALL_DATA_API}/teams/{a_id}/matches?limit=10", headers={"X-Auth-Token": FOOTBALL_DATA_TOKEN})
+
+            h_stats = calculate_detailed_stats(h_hist.json().get("matches", []), h_id)
+            a_stats = calculate_detailed_stats(a_hist.json().get("matches", []), a_id)
+
+            # Probabilidades Detalladas
+            probs = calculate_poisson_probs(h_stats["avg_goals"], a_stats["avg_conceded"])
+            
+            return {
+                "match": {
+                    "home": m_data["homeTeam"]["name"],
+                    "away": m_data["awayTeam"]["name"],
+                    "competition": m_data["competition"]["name"],
+                    "date": m_data["utcDate"]
+                },
+                "statistics": {
+                    "home": {
+                        "avg_goals_scored": h_stats["avg_goals"],
+                        "xg": h_stats["xg"],
+                        "avg_corners": h_stats["avg_corners"],
+                        "avg_yellow_cards": h_stats["avg_cards"],
+                        "form": h_stats["form"]
+                    },
+                    "away": {
+                        "avg_goals_scored": a_stats["avg_goals"],
+                        "xg": a_stats["xg"],
+                        "avg_corners": a_stats["avg_corners"],
+                        "avg_yellow_cards": a_stats["avg_cards"],
+                        "form": a_stats["form"]
+                    }
+                },
+                "predictions": {
+                    "result_1x2": probs,
+                    "goals": {
+                        "total_expected": round(h_stats["avg_goals"] + a_stats["avg_goals"], 2),
+                        "btts": 65 if (h_stats["avg_goals"] > 1 and a_stats["avg_goals"] > 1) else 40,
+                        "over_25": 70 if (h_stats["avg_goals"] + a_stats["avg_goals"] > 2.5) else 45
+                    },
+                    "corners": { "expected_total": round((h_stats["avg_corners"] + a_stats["avg_corners"])/2, 1) },
+                    "cards": { "expected_yellow": round((h_stats["avg_cards"] + a_stats["avg_cards"]), 1) }
+                }
+            }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- ENDPOINT 3: CHATBOT ---
+@app.post("/api/chatbot")
+async def chatbot(request: dict):
+    user_msg = request.get("message", "")
+    history = request.get("history", [])
+    match_ctx = request.get("match_details", None)
+    
+    context_prompt = ""
+    if match_ctx:
+        p = match_ctx['predictions']
+        context_prompt = f"""
+        CONTEXTO DEL PARTIDO ACTUAL:
+        {match_ctx['match']['home']} vs {match_ctx['match']['away']}
+        Probabilidad Victoria: Local {p['result_1x2']['home_win']}% | Empate {p['result_1x2']['draw']}% | Visita {p['result_1x2']['away_win']}%
+        Goles Esperados: {p['goals']['total_expected']}
+        """
+
+    messages = [
+        {"role": "system", "content": f"Eres BetBrain. Experto en apuestas. Sé breve y directo. {context_prompt}"}
+    ] + history[-5:] + [{"role": "user", "content": user_msg}]
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
+                json={"model": "anthropic/claude-3-haiku", "messages": messages}
+            )
+            return {"response": resp.json()["choices"][0]["message"]["content"]}
+    except:
+        return {"response": "Error conectando con la IA."}
